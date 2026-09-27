@@ -44,18 +44,53 @@ CLAUDE_SLACK_TOOL_NAME = "mcp__slack__slack_post_message"
 CLAUDE_NOTION_UPDATE_TOOL_NAME = "mcp__claude_ai_Notion__notion-update-page"
 CLAUDE_NOTION_CREATE_TOOL_NAME = "mcp__claude_ai_Notion__notion-create-pages"
 
+# Google Calendar, Claude side (Codex twin below; 2026-09-26, operator's instruction
+# 「カレンダーへの許可ルートを作ってくれ」).  Two acts: create one event, update
+# one event.  An event with attendees makes Google mail each of them, so the
+# attendee list and the notification level are REQUIRED to be written out in
+# the arguments (see _validate_claude_calendar_*): an absent key disappears
+# from the canonical form, and the connector's default for an absent
+# notificationLevel is ALL — the operator would approve a mail they never saw.
+#
+# `delete_event` has NO permit path, on purpose.  Its arguments are an eventId
+# and a notification level: the reviewer cannot see WHAT is being cancelled or
+# WHO receives the cancellation, and nothing here can undo it.  That fails the
+# operator's own test ("can it be undone?") and the review cannot make up for
+# it, so a delete stays in the approval queue and is done by hand.
+# `respond_to_event` has none either: an RSVP is speech to the organizer and
+# was not asked for.
+CLAUDE_CALENDAR_CREATE_TOOL_NAME = "mcp__claude_ai_Google_Calendar__create_event"
+CLAUDE_CALENDAR_UPDATE_TOOL_NAME = "mcp__claude_ai_Google_Calendar__update_event"
+# The Codex twin (2026-09-26, operator's ruling 「Codex 側の穴をふさいでよい」).
+# This connector's schema has NO notification-level argument, so who is mailed
+# cannot be bound — and when it cannot be bound, the permit does not open.
+# A Codex calendar permit is therefore for creating an event nobody else is
+# on (`attendees: []`), and nothing more.  There is NO Codex update path
+# (parent's ruling, 2026-09-26): an update mails the event's EXISTING
+# attendees, who are not in the arguments, and this connector cannot silence
+# them — what cannot be bound is not opened.  update_event stays denied.
+CODEX_CALENDAR_CREATE_TOOL_NAME = "mcp__codex_apps__google_calendar__create_event"
+
 # The exact wire names a permit may open, per CLI.  Deliberately narrow: one
 # email and one channel message on each side, plus — Claude only — one page
 # edit and one page creation.  Replies, drafts, forwards and edits have no
 # permit path and go through the approval queue.  Codex has no entry for
 # Notion: its guard names no Notion tool, so there is nothing to open there.
+# Codex's Calendar entry is narrower than Claude's: its connector cannot say
+# "do not notify", so it opens only the creation of an attendee-free event.
 CLI_TOOL_NAMES = {
-    "codex": {"gmail": GMAIL_TOOL_NAME, "slack": SLACK_TOOL_NAME},
+    "codex": {
+        "gmail": GMAIL_TOOL_NAME,
+        "slack": SLACK_TOOL_NAME,
+        "calendar-create": CODEX_CALENDAR_CREATE_TOOL_NAME,
+    },
     "claude": {
         "gmail": CLAUDE_GMAIL_TOOL_NAME,
         "slack": CLAUDE_SLACK_TOOL_NAME,
         "notion-update": CLAUDE_NOTION_UPDATE_TOOL_NAME,
         "notion-create": CLAUDE_NOTION_CREATE_TOOL_NAME,
+        "calendar-create": CLAUDE_CALENDAR_CREATE_TOOL_NAME,
+        "calendar-update": CLAUDE_CALENDAR_UPDATE_TOOL_NAME,
     },
 }
 # Where each CLI's guard looks for the store.  The guard derives the project
@@ -405,12 +440,214 @@ def _validate_claude_notion_create(tool_input) -> None:
 # Keyed by the exact wire tool name, which is unique across both CLIs, so the
 # right shape check is selected without the caller having to say which CLI it
 # came from.  A tool with no entry is bound by its hash alone.
+# The values an approved calendar write may state.  NOTIFICATION_LEVEL_UNSPECIFIED
+# is refused as well as absence: the connector treats it as ALL, so writing it
+# is the same as not saying.
+_CALENDAR_NOTIFICATION_LEVELS = frozenset({"NONE", "EXTERNAL_ONLY", "ALL"})
+
+
+def _require_notification_level(tool_input) -> None:
+    level = tool_input.get("notificationLevel")
+    if not isinstance(level, str) or level not in _CALENDAR_NOTIFICATION_LEVELS:
+        raise PermitError(
+            "Calendar notificationLevel must be written out as one of "
+            f"{', '.join(sorted(_CALENDAR_NOTIFICATION_LEVELS))} "
+            "(absent or UNSPECIFIED means ALL, which the reviewer would not see)"
+        )
+
+
+def _require_attendee_objects(value, key: str) -> None:
+    if not isinstance(value, list):
+        raise PermitError(f"Calendar {key} must be an array")
+    for attendee in value:
+        if not isinstance(attendee, dict):
+            raise PermitError(f"Calendar {key} must contain attendee objects")
+        email = attendee.get("email")
+        if not isinstance(email, str) or not email.strip():
+            raise PermitError(f"Calendar {key} entries must name an email")
+
+
+def _require_email_strings(value, key: str) -> None:
+    if not isinstance(value, list):
+        raise PermitError(f"Calendar {key} must be an array")
+    for email in value:
+        if not isinstance(email, str) or not email.strip():
+            raise PermitError(f"Calendar {key} must contain non-empty addresses")
+
+
+def _validate_claude_calendar_create(tool_input) -> None:
+    # create_event on the Claude connector.  `attendees` is REQUIRED as a key —
+    # `[]` for an event nobody else is invited to — so the list of people who
+    # get an invitation is always a visible line in `review`, never a default.
+    if not tool_input:
+        raise PermitError("Calendar tool_input must not be empty")
+    for key in ("summary", "startTime", "endTime"):
+        _require_text(tool_input, key, "Calendar")
+    if tool_input.get("attendeeEmails") is not None:
+        # the deprecated second channel for invitees: people named there would
+        # be invited without appearing under the key the reviewer reads.
+        raise PermitError("attendeeEmails is not valid for a permitted create; use attendees")
+    if "attendees" not in tool_input or tool_input.get("attendees") is None:
+        raise PermitError(
+            "Calendar create must write out attendees (an empty list for none)"
+        )
+    _require_attendee_objects(tool_input["attendees"], "attendees")
+    _require_notification_level(tool_input)
+    if _is_status_event(tool_input.get("eventType")):
+        # An out-of-office or focus-time block can auto-decline OTHER people's
+        # invitations, with a message to their organizers.  This connector has
+        # no auto-decline argument, so that cannot be bound — and what cannot
+        # be bound is not opened (independent review, 2026-09-27).
+        raise PermitError(
+            f"Calendar eventType {tool_input.get('eventType')} is not valid for a "
+            "permitted create: a status event may auto-decline other people's "
+            "invitations, and this connector cannot bind that"
+        )
+
+
+def _validate_claude_calendar_update(tool_input) -> None:
+    # update_event changes ONE event named by eventId.  Attendee changes come in
+    # through addedAttendees / removedAttendeeEmails; the deprecated
+    # addedAttendeeEmails is refused for the same reason as on create.  The
+    # notification level is required because an update mails the event's
+    # EXISTING attendees too, and those are not in the arguments at all.
+    if not tool_input:
+        raise PermitError("Calendar tool_input must not be empty")
+    _require_text(tool_input, "eventId", "Calendar")
+    if tool_input.get("addedAttendeeEmails") is not None:
+        raise PermitError(
+            "addedAttendeeEmails is not valid for a permitted update; use addedAttendees"
+        )
+    if tool_input.get("addedAttendees") is not None:
+        _require_attendee_objects(tool_input["addedAttendees"], "addedAttendees")
+    if tool_input.get("removedAttendeeEmails") is not None:
+        _require_email_strings(tool_input["removedAttendeeEmails"], "removedAttendeeEmails")
+    _require_notification_level(tool_input)
+
+
+# Status events that can auto-decline other people's invitations.  Compared
+# after folding case and dropping `_`, `-` and spaces, so `OUT_OF_OFFICE`,
+# `outOfOffice`, `out-of-office` and `FocusTime` all meet the same rule.
+_STATUS_EVENT_TYPES = frozenset({"outofoffice", "focustime"})
+
+
+def _is_status_event(value) -> bool:
+    if not isinstance(value, str):
+        return value is not None  # a non-string type is not trusted either
+    folded = "".join(ch for ch in value.casefold() if ch not in "_- \t")
+    return folded in _STATUS_EVENT_TYPES
+
+
+def _refuse_present(tool_input, key: str, why: str) -> None:
+    value = tool_input.get(key)
+    if value is not None and value != [] and value != "":
+        raise PermitError(f"Calendar {key} is not valid for a Codex permit: {why}")
+
+
+# Arguments that reach other people on the Codex connector.  auto_decline_mode
+# and decline_message make a status event DECLINE other people's invitations,
+# with a message to their organizers — speech, whatever the attendee list says.
+_CODEX_CALENDAR_REACHING = {
+    "attendee_optionality": "it names attendees",
+    "decline_message": "it is sent to the organizers of declined invitations",
+}
+
+
+def _refuse_auto_decline(tool_input) -> None:
+    mode = tool_input.get("auto_decline_mode")
+    if mode is not None and mode != "declineNone":
+        raise PermitError(
+            "Calendar auto_decline_mode is not valid for a Codex permit: "
+            "it declines other people's invitations"
+        )
+    if _is_status_event(tool_input.get("event_type")) and mode != "declineNone":
+        # Google's default auto-decline for a status event is not something
+        # this helper can see, so an out-of-office / focus-time block must SAY
+        # it declines nothing (independent review, 2026-09-27).
+        raise PermitError(
+            f"Calendar event_type {tool_input.get('event_type')} needs "
+            "auto_decline_mode \"declineNone\" written out for a Codex permit: "
+            "a status event may auto-decline other people's invitations"
+        )
+
+
+def _validate_codex_calendar_create(tool_input) -> None:
+    # The Codex connector has no notification level, so the only event whose
+    # mail can be bound is one that mails nobody: attendees must be written
+    # out and must be empty.
+    if not tool_input:
+        raise PermitError("Calendar tool_input must not be empty")
+    for key in ("title", "start_time", "end_time"):
+        _require_text(tool_input, key, "Calendar")
+    attendees = tool_input.get("attendees")
+    if not isinstance(attendees, list):
+        raise PermitError("Calendar create must write out attendees as []")
+    if attendees:
+        raise PermitError(
+            "a Codex calendar permit opens only an event with no attendees "
+            "(this connector cannot bind who is notified); use the approval queue"
+        )
+    for key, why in _CODEX_CALENDAR_REACHING.items():
+        _refuse_present(tool_input, key, why)
+    _refuse_auto_decline(tool_input)
+
+
+def calendar_attention(tool_name: str, tool_input) -> dict | None:
+    """The lines an approver must see before a calendar write, pulled forward.
+
+    The full canonical payload is printed too; this block only makes sure that
+    who is mailed, and how, is not buried in it.  It is display only — the
+    hash is over the canonical payload and nothing here changes it.
+    """
+    if tool_name == CLAUDE_CALENDAR_CREATE_TOOL_NAME:
+        return {
+            "act": "create one event",
+            "attendees_invited": [a.get("email") for a in tool_input.get("attendees", [])],
+            "notificationLevel": tool_input.get("notificationLevel"),
+            "calendarId": tool_input.get("calendarId", "primary (default)"),
+            "startTime": tool_input.get("startTime"),
+            "endTime": tool_input.get("endTime"),
+            "recurrenceData": tool_input.get("recurrenceData"),
+            "note": "each attendee receives an invitation mail unless notificationLevel is NONE",
+        }
+    if tool_name == CLAUDE_CALENDAR_UPDATE_TOOL_NAME:
+        return {
+            "act": "update one existing event",
+            "eventId": tool_input.get("eventId"),
+            "attendees_added": [a.get("email") for a in tool_input.get("addedAttendees", [])],
+            "attendees_removed": tool_input.get("removedAttendeeEmails", []),
+            "notificationLevel": tool_input.get("notificationLevel"),
+            "calendarId": tool_input.get("calendarId", "primary (default)"),
+            "startTime": tool_input.get("startTime"),
+            "endTime": tool_input.get("endTime"),
+            "note": (
+                "the event's EXISTING attendees are not in these arguments and "
+                "are mailed per notificationLevel — read the event first "
+                "(get_event) to see who they are"
+            ),
+        }
+    if tool_name == CODEX_CALENDAR_CREATE_TOOL_NAME:
+        return {
+            "act": "create one event with no attendees",
+            "attendees_invited": [],
+            "calendar_id": tool_input.get("calendar_id", "primary (default)"),
+            "start_time": tool_input.get("start_time"),
+            "end_time": tool_input.get("end_time"),
+            "recurrence": tool_input.get("recurrence"),
+            "note": "Codex cannot set a notification level; only attendee-free events have a permit path",
+        }
+    return None
+
+
 INPUT_VALIDATORS = {
     SLACK_TOOL_NAME: _validate_codex_slack,
     CLAUDE_SLACK_TOOL_NAME: _validate_claude_slack,
     CLAUDE_GMAIL_TOOL_NAME: _validate_claude_gmail,
     CLAUDE_NOTION_UPDATE_TOOL_NAME: _validate_claude_notion_update,
     CLAUDE_NOTION_CREATE_TOOL_NAME: _validate_claude_notion_create,
+    CLAUDE_CALENDAR_CREATE_TOOL_NAME: _validate_claude_calendar_create,
+    CLAUDE_CALENDAR_UPDATE_TOOL_NAME: _validate_claude_calendar_update,
+    CODEX_CALENDAR_CREATE_TOOL_NAME: _validate_codex_calendar_create,
 }
 
 
@@ -424,12 +661,16 @@ def validated_canonical_input(tool_name: str, tool_input) -> str:
 
 def review_record(tool_name: str, tool_input) -> dict:
     canonical = validated_canonical_input(tool_name, tool_input)
-    return {
+    record = {
         "tool_name": tool_name,
         "canonical_tool_input": strict_loads(canonical),
         "canonical_json": canonical,
         "sha256": digest(canonical),
     }
+    attention = calendar_attention(tool_name, record["canonical_tool_input"])
+    if attention is not None:
+        record["calendar_attention"] = attention
+    return record
 
 
 def print_review(tool_name: str, tool_input) -> str:
