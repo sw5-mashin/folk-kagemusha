@@ -525,6 +525,40 @@ o_issue "$O_SEND" sess-fresh 300
 assert_eq "O10: …while an unexpired permit of the same shape still passes" "pass" \
   "$(o_claim "$(o_envelope "$O_SEND" sess-fresh "$O_ROOT")")"
 
+# the WSL2 clock can step back ~1s between issue and claim (2026-10-06): a
+# permit dated a few seconds ahead is honest; one dated a minute ahead is not.
+o_issue "$O_SEND" sess-skew 300
+assert_eq "O10: a permit dated 3s ahead (clock stepped back) is on disk" "1" \
+  "$(o_repoint sess-skew 3 303)"
+assert_eq "O10: …and still claims (small clock skew is tolerated)" "pass" \
+  "$(o_claim "$(o_envelope "$O_SEND" sess-skew "$O_ROOT")")"
+o_issue "$O_SEND" sess-future 300
+assert_eq "O10: a permit dated 60s ahead is on disk" "1" "$(o_repoint sess-future 60 360)"
+assert_eq "O10: …and is refused" "deny" \
+  "$(o_claim "$(o_envelope "$O_SEND" sess-future "$O_ROOT")")"
+# the boundary, with the clock injected rather than read: +5 accepted, +6 refused
+assert_eq "O10: validate_permit accepts created_at up to +5s and refuses +6s" "ok" \
+  "$(O_P="$O_PERMIT" python3 -c '
+import importlib.util, os
+spec = importlib.util.spec_from_file_location("op", os.environ["O_P"]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+tools = frozenset(m.CLI_TOOL_NAMES["claude"].values())
+def rec(ahead):
+    canon = m.validated_canonical_input(m.CLAUDE_SLACK_TOOL_NAME, {"channel_id": "C1", "text": "x"})
+    return {"version": m.VERSION, "permit_id": "a"*32, "tool_name": m.CLAUDE_SLACK_TOOL_NAME,
+            "tool_input_sha256": m.digest(canon), "tool_input_canonical": canon,
+            "project_root": "/p", "session_id": "s", "created_at": 1000 + ahead,
+            "expires_at": 1000 + ahead + 300, "approval_ref": "r", "approval_quote": "q"}
+m.validate_permit(rec(5), 1000, tools)
+try:
+    m.validate_permit(rec(6), 1000, tools); print("accepted +6")
+except m.PermitError:
+    print("ok")')"
+# remove only that refused record: one invalid pending permit fails every claim
+O_R="$O_ROOT" python3 -c '
+import json, os, pathlib
+for p in (pathlib.Path(os.environ["O_R"]) / ".claude/outbound-permits/pending").glob("*.json"):
+    if json.loads(p.read_text())["session_id"] == "sess-future": p.unlink()'
+
 # ── the flake's mechanism, pinned so a fix is a DELIBERATE change ─────────
 # DOCUMENTS CURRENT BEHAVIOUR, and current behaviour is a known weakness.
 # `validate_permit` RAISES from inside the scan loop, so one unusable permit in
